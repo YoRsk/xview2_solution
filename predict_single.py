@@ -70,61 +70,62 @@ configs = [
     ModelConfig("configs/r101_softmax_sgd.json", "sgd_resnext_seamese_unet_shared_resnext101_0_best_xview", "damage", 2)
 ]
 
-
 def predict_localization(image, config: ModelConfig):
     conf = load_config(config.config_path)
     model = models.__dict__[conf['network']](seg_classes=1, backbone_arch=conf['encoder'])
     checkpoint_path = os.path.join(weight_path, config.weight_path)
     print("=> loading checkpoint '{}'".format(checkpoint_path))
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # 直接加载到 GPU
+    checkpoint = torch.load(checkpoint_path, map_location="cuda")
     model.load_state_dict({k.replace("module.", ""): v for k, v in checkpoint['state_dict'].items()})
 
     model.eval()
-
-    model = model.cpu()
+    model = model.cuda()  # 移到 GPU
     print("predicting", config)
+    
     with torch.no_grad():
-        
-        # transform = ToTensorV2()
-        # image = transform(image=image)['image'].cpu().numpy()   
-
-        # image = img_to_tensor(image, conf["input"]["normalize"]).cpu().numpy()
         normalize = {
-            'mean': conf["input"]["normalize"]["mean"][:3],  # 只取前3个
-            'std': conf["input"]["normalize"]["std"][:3]     # 只取前3个
+            'mean': conf["input"]["normalize"]["mean"][:3],
+            'std': conf["input"]["normalize"]["std"][:3]
         }
-        image = img_to_tensor(image, normalize).cpu().numpy()
+        # 保持 tensor 格式，直接转到 GPU
+        image = img_to_tensor(image, normalize).cuda()
+        
         if "dpn" in config.weight_path:
-            image = np.pad(image, [(0, 0), (16, 16), (16, 16)], mode='reflect')
+            # numpy操作放在CPU上做
+            image_np = image.cpu().numpy()
+            image_np = np.pad(image_np, [(0, 0), (16, 16), (16, 16)], mode='reflect')
+            image = torch.from_numpy(image_np).cuda()
 
-        images = np.array(
-            [
-                image,
-                image[:, ::-1, :],
-                image[:, :, ::-1],
-                image[:, ::-1, ::-1],
-            ])
-        images = torch.from_numpy(images).cpu().float()
+        # 在GPU上做数据增强
+        images = torch.stack([
+            image,
+            image.flip(1),  # 水平翻转
+            image.flip(2),  # 垂直翻转
+            image.flip(1).flip(2)  # 同时翻转
+        ])
+        
         prediction_masks = []
         for i in range(4):
-
             logits = model(images[i:i + 1])
-            preds = torch.sigmoid(logits).cpu().numpy()
-
-            pred = preds[0]
+            preds = torch.sigmoid(logits)
+            
+            # 处理完再移到CPU
+            pred = preds[0].cpu().numpy()
             if i == 1:
-                pred = preds[0].copy()[:, ::-1, :]
+                pred = pred[:, ::-1, :]
             if i == 2:
-                pred = preds[0].copy()[:, :, ::-1]
+                pred = pred[:, :, ::-1]
             if i == 3:
-                pred = preds[0].copy()[:, ::-1, ::-1]
+                pred = pred[:, ::-1, ::-1]
             prediction_masks.append(pred)
+
+            torch.cuda.empty_cache()  # 清理GPU内存
 
         preds = np.average(prediction_masks, axis=0)
         if "dpn" in config.weight_path:
             preds = preds[:, 16:-16, 16:-16]
         return preds
-
 
 def predict_localization_ensemble(pre_path):
     # cv2.imread() 读取时总是会转成 BGR 格式，所以要用 [:, :, ::-1] 转成 RGB 格式
@@ -158,42 +159,45 @@ def predict_damage(image, config: ModelConfig):
     model = models.__dict__[conf['network']](seg_classes=5, backbone_arch=conf['encoder'])
     checkpoint_path = os.path.join(weight_path, config.weight_path)
     print("=> loading checkpoint '{}'".format(checkpoint_path))
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cuda")
     model.load_state_dict({k[7:]: v for k, v in checkpoint['state_dict'].items()})
 
     model.eval()
-
-    model = model.cpu()
+    model = model.cuda()  # 移到GPU
     print("predicting", config)
+    
     with torch.no_grad():
-        image = img_to_tensor(image, conf["input"]["normalize"]).cpu().numpy()
-        images = np.array(
-            [
-                image,
-                image[:, ::-1, :],
-                image[:, :, ::-1],
-                image[:, ::-1, ::-1],
-            ])
-        images = torch.from_numpy(images).cpu().float()
+        # 转换成tensor并移到GPU
+        image = img_to_tensor(image, conf["input"]["normalize"]).cuda()
+        
+        # 在GPU上做数据增强
+        images = torch.stack([
+            image,
+            image.flip(1),
+            image.flip(2),
+            image.flip(1).flip(2)
+        ])
+        
         prediction_masks = []
         for i in range(4):
-
             logits = model(images[i:i + 1])
-            preds = torch.softmax(logits, dim=1).cpu().numpy()
-
-            pred = preds[0]
+            preds = torch.softmax(logits, dim=1)
+            
+            # 处理完再移到CPU
+            pred = preds[0].cpu().numpy()
             if i == 1:
-                pred = preds[0].copy()[:, ::-1, :]
+                pred = pred[:, ::-1, :]
             if i == 2:
-                pred = preds[0].copy()[:, :, ::-1]
+                pred = pred[:, :, ::-1]
             if i == 3:
-                pred = preds[0].copy()[:, ::-1, ::-1]
+                pred = pred[:, ::-1, ::-1]
             prediction_masks.append(pred)
+            
+            torch.cuda.empty_cache()  # 清理GPU内存
 
         preds = np.average(prediction_masks, axis=0)
         return preds
-
-
+    
 def label_mask(loc, labels, intensity, mask, seed_threshold=0.8):
     """
     Identify and label individual building regions based on damage predictions.
