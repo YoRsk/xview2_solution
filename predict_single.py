@@ -1,3 +1,13 @@
+import ssl
+try:
+    # 尝试正常下载
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    # 如果失败，则禁用证书验证
+    pass
+else:
+    # 仅对这个特定域名禁用验证
+    ssl._create_default_https_context = _create_unverified_https_context
 import argparse
 import os
 
@@ -13,7 +23,8 @@ import skimage.io
 import torch
 from albumentations.pytorch.transforms import img_to_tensor
 from skimage import measure
-from skimage.morphology import watershed
+# from skimage.morphology import watershed
+from skimage.segmentation import watershed  # 改成这个
 
 import models
 from tools.config import load_config
@@ -25,7 +36,7 @@ configs = [
     ModelConfig("configs/d92_loc.json", "localization_dpn_unet_dpn92_1_best_dice", "localization", 1),
     ModelConfig("configs/d92_loc.json", "localization_dpn_unet_dpn92_2_best_dice", "localization", 1),
     ModelConfig("configs/d92_loc.json", "localization_dpn_unet_dpn92_3_best_dice", "localization", 1),
-     ModelConfig("configs/d161_loc.json", "localization_densenet_unet_densenet161_3_0_best_dice", "localization", 1),
+    ModelConfig("configs/d161_loc.json", "localization_densenet_unet_densenet161_3_0_best_dice", "localization", 1),
     ModelConfig("configs/d161_loc.json", "localization_densenet_unet_densenet161_3_1_best_dice", "localization", 1),
 
     ModelConfig("configs/d92_softmax.json", "softmax_dpn_seamese_unet_shared_dpn92_0_best_xview", "damage", 1),
@@ -73,7 +84,16 @@ def predict_localization(image, config: ModelConfig):
     model = model.cpu()
     print("predicting", config)
     with torch.no_grad():
-        image = img_to_tensor(image, conf["input"]["normalize"]).cpu().numpy()
+        
+        # transform = ToTensorV2()
+        # image = transform(image=image)['image'].cpu().numpy()   
+
+        # image = img_to_tensor(image, conf["input"]["normalize"]).cpu().numpy()
+        normalize = {
+            'mean': conf["input"]["normalize"]["mean"][:3],  # 只取前3个
+            'std': conf["input"]["normalize"]["std"][:3]     # 只取前3个
+        }
+        image = img_to_tensor(image, normalize).cpu().numpy()
         if "dpn" in config.weight_path:
             image = np.pad(image, [(0, 0), (16, 16), (16, 16)], mode='reflect')
 
@@ -107,7 +127,9 @@ def predict_localization(image, config: ModelConfig):
 
 
 def predict_localization_ensemble(pre_path):
+    # cv2.imread() 读取时总是会转成 BGR 格式，所以要用 [:, :, ::-1] 转成 RGB 格式
     image = cv2.imread(pre_path, cv2.IMREAD_COLOR)[:, :, ::-1]
+    image = cv2.resize(image, (1024, 1024))
     preds = []
     for model_config in configs:
         if model_config.type == "localization":
@@ -118,7 +140,9 @@ def predict_localization_ensemble(pre_path):
 def predict_damage_ensemble(pre_path, post_path):
     image_pre = cv2.imread(pre_path, cv2.IMREAD_COLOR)[:, :, ::-1]
     image_post = cv2.imread(post_path, cv2.IMREAD_COLOR)[:, :, ::-1]
-    image = np.concatenate([image_pre, image_post], axis=-1)
+    image_pre = cv2.resize(image_pre, (1024, 1024)) # 1024x1024
+    image_post = cv2.resize(image_post, (1024, 1024))
+    image = np.concatenate([image_pre, image_post], axis=-1) #合体变成6通道
     preds = []
     for model_config in configs:
         if model_config.type == "damage":
@@ -171,10 +195,33 @@ def predict_damage(image, config: ModelConfig):
 
 
 def label_mask(loc, labels, intensity, mask, seed_threshold=0.8):
+    """
+    Identify and label individual building regions based on damage predictions.
+    For each building region:
+    - Examine the distribution of damage predictions within the region.
+    - If a certain type of damage is dominant (>60%) and the building shape is reasonable 
+      (not too elongated, no holes), update the labels of low-confidence areas with this 
+      dominant damage type.
+    Parameters:
+    loc (numpy.ndarray): The localization predictions.
+    labels (numpy.ndarray): The initial labels for the regions.
+    intensity (numpy.ndarray): The intensity of the predictions.
+    mask (numpy.ndarray): The mask to apply for the watershed algorithm.
+    seed_threshold (float, optional): The threshold for seed localization. Defaults to 0.8.
+    Returns:
+    numpy.ndarray: The labeled regions after applying the watershed algorithm.
+    识别独立的建筑物区域
+    对每个建筑物区域：
+
+    查看区域内的损伤预测分布
+    如果某种损伤类型占主导（>60%）
+    且建筑物形状合理（不太细长，没有空洞）
+    则用这个主导损伤类型来更新低置信度区域的标签
+    """
     av_pred = 1 * (loc > seed_threshold)
     av_pred = av_pred.astype(np.uint8)
-
-    y_pred = measure.label(av_pred, neighbors=8, background=0)
+    y_pred = measure.label(av_pred, background=0) #移除 connectivity/neighbors 参数（默认就是 8邻域连通）
+    # y_pred = measure.label(av_pred, neighbors=8, background=0)
 
     nucl_msk = (1 - loc)
     nucl_msk = nucl_msk.astype('uint8')
@@ -210,11 +257,22 @@ def post_process(loc, damage, out_loc, out_damage):
 
     argmax = np.argmax(damage_pred, axis=-1)
     loc = 1 * ((localization > 0.25) | (argmax > 0))
-    argmax = np.argmax(damage, axis=-1) + 1
+    # argmax = np.argmax(damage, axis=-1) + 1
     max = np.max(damage, axis=-1)
     label_mask(localization, argmax, max, loc)
-    cv2.imwrite(out_loc, loc)
-    cv2.imwrite(out_damage, argmax)
+    print("Saving final results to:", out_loc, out_damage)
+    print("loc shape:", loc.shape)
+    print("argmax shape:", argmax.shape)
+    
+    os.makedirs(os.path.dirname(out_loc), exist_ok=True)
+    os.makedirs(os.path.dirname(out_damage), exist_ok=True)
+    
+    try:
+        cv2.imwrite(out_loc, (loc * 255).astype(np.uint8))
+        cv2.imwrite(out_damage, argmax.astype(np.uint8))
+        print("Successfully saved final results")
+    except Exception as e:
+        print(f"Error saving final results: {e}")
 
 
 def main():
@@ -231,8 +289,8 @@ def main():
     preds = (np.moveaxis(damage, 0, -1)).astype(np.uint8)
     cv2.imwrite("_damage.png", cv2.cvtColor(preds[:, :, 1:], cv2.COLOR_RGBA2BGRA))
     damage = skimage.io.imread("_damage.png")
-    localization = cv2.imread( "_localization.png", cv2.IMREAD_GRAYSCALE)
-    post_process(localization, damage, args.out_loc,  args.out_damage)
+    localization = cv2.imread("_localization.png", cv2.IMREAD_GRAYSCALE)
+    post_process(localization, damage, args.out_loc, args.out_damage)
 
 
 
