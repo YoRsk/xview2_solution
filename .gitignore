@@ -2,3 +2,6 @@
 .idea/*
 data/*
 data/xview/*
+**/*.png
+weights/
+**/*.pyc
