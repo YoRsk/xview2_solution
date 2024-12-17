@@ -157,8 +157,10 @@ def predict_damage(image, config: ModelConfig):
     model.eval()
     model = model.cuda()
     h, w = image.shape[:2]
-    window_size = 1024
-    stride = 768
+    window_size = 512
+    stride = 480
+    # window_size = 1024
+    # stride = 768
     
     # 输出维度保持 (5,h,w)
     output = np.zeros((5, h, w), dtype=np.float32)
