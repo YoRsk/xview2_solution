@@ -20,7 +20,9 @@ def visualize_damage(damage_path, output_path):
     # 定义颜色映射
     # BGR 格式
     colors = {
-        0: (0, 0, 0),      # 黑色
+        # replace black to grey when show 
+        #0: (0, 0, 0),      # 黑色
+        0: (192, 192, 192), # 灰色
         1: (255, 0, 0),    # 蓝色
         2: (0, 255, 0),    # 绿色
         3: (0, 255, 255),  # 黄色
