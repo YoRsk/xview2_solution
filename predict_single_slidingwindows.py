@@ -17,6 +17,8 @@ from skimage.segmentation import watershed
 import models
 from tools.config import load_config
 from collections import namedtuple
+import torchmetrics
+from torchmetrics import JaccardIndex
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -296,6 +298,101 @@ def post_process(loc, damage, out_loc, out_damage):
         print("Successfully saved final results")
     except Exception as e:
         print(f"Error saving final results: {e}")
+
+def calculate_metrics(prediction, ground_truth):
+    """
+    计算评估指标:
+    - 5分类指标：准确率、F1分数、IoU、精确率、召回率
+    - 二分类指标：准确率、F1分数、IoU、精确率、召回率
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 计算5分类指标
+    prediction = prediction.astype(np.int64)
+    ground_truth = ground_truth.astype(np.int64)
+    prediction_tensor = torch.from_numpy(prediction).long().unsqueeze(0).to(device)
+    ground_truth_tensor = torch.from_numpy(ground_truth).long().unsqueeze(0).to(device)
+    
+    # 初始化5分类metrics（排除背景类）
+    accuracy_5 = torchmetrics.Accuracy(task='multiclass', num_classes=5, 
+                                     ignore_index=0, validate_args=False).to(device)
+    precision_5 = torchmetrics.Precision(task='multiclass', num_classes=5, 
+                                       ignore_index=0, average='macro', validate_args=False).to(device)
+    recall_5 = torchmetrics.Recall(task='multiclass', num_classes=5, 
+                                  ignore_index=0, average='macro', validate_args=False).to(device)
+    f1_score_5 = torchmetrics.F1Score(task='multiclass', num_classes=5, 
+                                     ignore_index=0, average='macro').to(device)
+    f1_score_5_per_class = torchmetrics.F1Score(task='multiclass', num_classes=5, 
+                                               ignore_index=0, average=None).to(device)
+    iou_5 = torchmetrics.JaccardIndex(task="multiclass", num_classes=5, 
+                                     ignore_index=0).to(device)
+    
+    # 更新metrics
+    accuracy_5.update(prediction_tensor, ground_truth_tensor)
+    precision_5.update(prediction_tensor, ground_truth_tensor)
+    recall_5.update(prediction_tensor, ground_truth_tensor)
+    f1_score_5.update(prediction_tensor, ground_truth_tensor)
+    f1_score_5_per_class.update(prediction_tensor, ground_truth_tensor)
+    iou_5.update(prediction_tensor, ground_truth_tensor)
+    
+    # 计算结果
+    acc_5 = accuracy_5.compute()
+    prec_5 = precision_5.compute()
+    rec_5 = recall_5.compute()
+    f1_5 = f1_score_5.compute()
+    f1_5_per_class = f1_score_5_per_class.compute()
+    iou_score_5 = iou_5.compute()
+    
+    # 创建二分类版本 (保持0为背景)
+    binary_prediction = prediction.copy()
+    binary_ground_truth = ground_truth.copy()
+    
+    # 将2,3,4类转换为2（损坏类）
+    binary_prediction[(binary_prediction == 2) | (binary_prediction == 3) | (binary_prediction == 4)] = 2
+    binary_ground_truth[(binary_ground_truth == 2) | (binary_ground_truth == 3) | (binary_ground_truth == 4)] = 2
+    
+    # 转换为tensor
+    binary_prediction_tensor = torch.from_numpy(binary_prediction).long().unsqueeze(0).to(device)
+    binary_ground_truth_tensor = torch.from_numpy(binary_ground_truth).long().unsqueeze(0).to(device)
+    
+    # 初始化二分类metrics（排除背景类）
+    accuracy_2 = torchmetrics.Accuracy(task='multiclass', num_classes=3, 
+                                     ignore_index=0, validate_args=False).to(device)
+    precision_2 = torchmetrics.Precision(task='multiclass', num_classes=3, 
+                                       ignore_index=0, average='macro', validate_args=False).to(device)
+    recall_2 = torchmetrics.Recall(task='multiclass', num_classes=3, 
+                                  ignore_index=0, average='macro', validate_args=False).to(device)
+    f1_score_2 = torchmetrics.F1Score(task='multiclass', num_classes=3, 
+                                     ignore_index=0, average='macro').to(device)
+    f1_score_2_per_class = torchmetrics.F1Score(task='multiclass', num_classes=3, 
+                                               ignore_index=0, average=None).to(device)
+    iou_2 = torchmetrics.JaccardIndex(task="multiclass", num_classes=3, 
+                                     ignore_index=0).to(device)
+    
+    # 更新二分类metrics
+    accuracy_2.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    precision_2.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    recall_2.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    f1_score_2.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    f1_score_2_per_class.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    iou_2.update(binary_prediction_tensor, binary_ground_truth_tensor)
+    
+    # 计算二分类结果
+    acc_2 = accuracy_2.compute()
+    prec_2 = precision_2.compute()
+    rec_2 = recall_2.compute()
+    f1_2 = f1_score_2.compute()
+    f1_2_per_class = f1_score_2_per_class.compute()
+    iou_score_2 = iou_2.compute()
+    
+    # 清除缓存
+    for metric in [accuracy_5, precision_5, recall_5, f1_score_5, iou_5, f1_score_5_per_class,
+                  accuracy_2, precision_2, recall_2, f1_score_2, iou_2, f1_score_2_per_class]:
+        metric.reset()
+    
+    return (acc_5.item(), f1_5.item(), iou_score_5.item(), prec_5.item(), rec_5.item(), f1_5_per_class.tolist(),
+            acc_2.item(), f1_2.item(), iou_score_2.item(), prec_2.item(), rec_2.item(), f1_2_per_class.tolist())
+
 def main():
     parser = argparse.ArgumentParser("Xview Predictor")
     arg = parser.add_argument
@@ -303,25 +400,62 @@ def main():
     arg('--post', type=str, help='Path to post test image')
     arg('--out-loc', type=str, help='Path to output localization image')
     arg('--out-damage', type=str, help='Path to output damage image')
+    # 只添加这一行参数
+    arg('--ground-truth', type=str, default='', help='Path to ground truth mask file (for evaluation)')
     args = parser.parse_args()
-
-    print("Predicting localization...")
+    
+    # [保持原有代码完全不变，包括所有注释]
     localization = predict_localization_ensemble(args.pre)
     skimage.io.imsave("_localization.png", localization[0, :, :].astype(np.uint8))
-    
-    print("Predicting damage...")
-    damage = predict_damage_ensemble(args.pre, args.post)  # (5,h,w)
-    damage_for_save = (np.moveaxis(damage, 0, -1)).astype(np.uint8)
-
-    cv2.imwrite("_damage.png", cv2.cvtColor(damage_for_save[:, :, 1:], cv2.COLOR_RGBA2BGRA, cv2.COLOR_RGBA2BGRA))
-    # se
-    # damage = (damage * 255).astype(np.uint8)
-    # damage_for_save = np.transpose(damage[1:], (1, 2, 0))  
-    # cv2.imwrite("_damage.png", cv2.cvtColor(damage_for_save, cv2.COLOR_RGB2BGRA))
-    
-    print("Post-processing results...")
+    damage = predict_damage_ensemble(args.pre, args.post)
+    preds = (np.moveaxis(damage, 0, -1)).astype(np.uint8)
+    cv2.imwrite("_damage.png", cv2.cvtColor(preds[:, :, 1:], cv2.COLOR_RGBA2BGRA))
     damage = skimage.io.imread("_damage.png")
     localization = cv2.imread("_localization.png", cv2.IMREAD_GRAYSCALE)
     post_process(localization, damage, args.out_loc, args.out_damage)
+
+    # 在最后添加评估部分
+    if args.ground_truth:
+        try:
+            # 使用 skimage.io 替代 cv2.imread
+            prediction = skimage.io.imread(args.out_damage)
+            ground_truth = skimage.io.imread(args.ground_truth)
+            
+            # 确保是单通道灰度图
+            if len(prediction.shape) > 2:
+                prediction = prediction[:,:,0]
+            if len(ground_truth.shape) > 2:
+                ground_truth = ground_truth[:,:,0]
+                
+            if ground_truth.shape != prediction.shape:
+                ground_truth = cv2.resize(ground_truth, (prediction.shape[1], prediction.shape[0]), 
+                                    interpolation=cv2.INTER_NEAREST)
+            
+            metrics = calculate_metrics(prediction, ground_truth)
+            
+            print("\nMulti-classes evaluation result:")
+            print(f'Accuracy: {metrics[0]:.4f}')
+            print(f'F1 Score: {metrics[1]:.4f}')
+            print(f'IoU: {metrics[2]:.4f}')
+            print(f'Precision: {metrics[3]:.4f}')
+            print(f'Recall: {metrics[4]:.4f}')
+            print("\nEach class f1 score:")
+            class_names_5 = ['Background', 'No Damage', 'Minor Damage', 'Major Damage', 'Destroyed']
+            for i, f1 in enumerate(metrics[5]):
+                print(f'{class_names_5[i]}: {f1:.4f}')
+            
+            print("\nBinary-classes (undamaged vs damaged):")
+            print(f'Accuracy: {metrics[6]:.4f}')
+            print(f'F1 Score: {metrics[7]:.4f}')
+            print(f'IoU: {metrics[8]:.4f}')
+            print(f'Precision: {metrics[9]:.4f}')
+            print(f'Recall: {metrics[10]:.4f}')
+            print("\nEach class f1 score:")
+            class_names_2 = ['Background', 'Undamaged', 'Damaged']
+            for i, f1 in enumerate(metrics[11]):
+                print(f'{class_names_2[i]}: {f1:.4f}')
+                
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
 if __name__ == '__main__':
     main()
